@@ -1,1 +1,794 @@
-
+name: Build & Release APK
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+      - name: Generate Project Files
+        shell: bash
+        run: |
+          set -e
+          cat > settings.gradle << 'SETTINGS'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "RequestTracker"
+          include ':app'
+          SETTINGS
+          cat > build.gradle << 'ROOTGRADLE'
+          buildscript {
+              ext { kotlin_version = '1.9.0' }
+              repositories { google(); mavenCentral() }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.1.4'
+                  classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+                  classpath 'com.google.dagger:hilt-android-gradle-plugin:2.48'
+              }
+          }
+          allprojects { repositories { google(); mavenCentral() } }
+          ROOTGRADLE
+          mkdir -p app
+          cat > app/build.gradle << 'APPGRADLE'
+          plugins {
+              id 'com.android.application'
+              id 'kotlin-android'
+              id 'kotlin-kapt'
+              id 'dagger.hilt.android.plugin'
+          }
+          android {
+              namespace 'com.requesttracker'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.requesttracker"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes { release { minifyEnabled false } }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+              buildFeatures { viewBinding true }
+          }
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.12.0'
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'com.google.android.material:material:1.11.0'
+              implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+              implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.7.0'
+              implementation 'androidx.lifecycle:lifecycle-livedata-ktx:2.7.0'
+              implementation 'androidx.activity:activity-ktx:1.8.2'
+              implementation 'androidx.fragment:fragment-ktx:1.6.2'
+              implementation 'androidx.navigation:navigation-fragment-ktx:2.7.6'
+              implementation 'androidx.navigation:navigation-ui-ktx:2.7.6'
+              implementation 'androidx.room:room-runtime:2.6.1'
+              implementation 'androidx.room:room-ktx:2.6.1'
+              kapt 'androidx.room:room-compiler:2.6.1'
+              implementation 'com.google.dagger:hilt-android:2.48'
+              kapt 'com.google.dagger:hilt-android-compiler:2.48'
+              implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+              implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+              implementation 'androidx.recyclerview:recyclerview:1.3.2'
+              implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+              implementation 'com.google.code.gson:gson:2.10.1'
+          }
+          APPGRADLE
+          mkdir -p app/src/main/java/com/requesttracker/{data/{db,model,repository},di,ui/{dashboard,detail,logs},service,util}
+          mkdir -p app/src/main/res/{layout,values,drawable,menu,navigation,xml}
+          for dpi in mdpi hdpi xhdpi xxhdpi xxxhdpi; do mkdir -p app/src/main/res/mipmap-$dpi; done
+          SRC=app/src/main/java/com/requesttracker
+          RES=app/src/main/res
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <application android:name=".RequestTrackerApp" android:allowBackup="true"
+                  android:label="@string/app_name" android:theme="@style/Theme.RequestTracker"
+                  android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round">
+                  <activity android:name=".ui.MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <activity android:name=".ui.detail.RequestDetailActivity" android:exported="false"
+                      android:parentActivityName=".ui.MainActivity"/>
+                  <service android:name=".service.RequestMonitorService" android:exported="false"
+                      android:foregroundServiceType="dataSync"/>
+                  <provider android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false" android:grantUriPermissions="true">
+                      <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths"/>
+                  </provider>
+              </application>
+          </manifest>
+          EOF
+          cat > $SRC/RequestTrackerApp.kt << 'EOF'
+          package com.requesttracker
+          import android.app.Application
+          import dagger.hilt.android.HiltAndroidApp
+          @HiltAndroidApp
+          class RequestTrackerApp : Application()
+          EOF
+          cat > $SRC/data/model/RequestLog.kt << 'EOF'
+          package com.requesttracker.data.model
+          import androidx.room.Entity
+          import androidx.room.PrimaryKey
+          enum class RequestType { HTTP, APP_TO_APP }
+          enum class RequestStatus { SUCCESS, ERROR, PENDING }
+          @Entity(tableName = "request_logs")
+          data class RequestLog(
+              @PrimaryKey(autoGenerate = true) val id: Long = 0,
+              val type: RequestType, val method: String, val url: String,
+              val requestHeaders: String, val requestBody: String?,
+              val responseCode: Int?, val responseHeaders: String?,
+              val responseBody: String?, val status: RequestStatus,
+              val durationMs: Long?, val sourceApp: String?, val targetApp: String?,
+              val timestamp: Long = System.currentTimeMillis(), val errorMessage: String?
+          )
+          EOF
+          cat > $SRC/data/db/Converters.kt << 'EOF'
+          package com.requesttracker.data.db
+          import androidx.room.TypeConverter
+          import com.requesttracker.data.model.RequestStatus
+          import com.requesttracker.data.model.RequestType
+          class Converters {
+              @TypeConverter fun fromType(v: RequestType) = v.name
+              @TypeConverter fun toType(v: String) = RequestType.valueOf(v)
+              @TypeConverter fun fromStatus(v: RequestStatus) = v.name
+              @TypeConverter fun toStatus(v: String) = RequestStatus.valueOf(v)
+          }
+          EOF
+          cat > $SRC/data/db/RequestLogDao.kt << 'EOF'
+          package com.requesttracker.data.db
+          import androidx.room.*
+          import com.requesttracker.data.model.RequestLog
+          import kotlinx.coroutines.flow.Flow
+          @Dao
+          interface RequestLogDao {
+              @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun insert(log: RequestLog): Long
+              @Delete suspend fun delete(log: RequestLog)
+              @Query("DELETE FROM request_logs") suspend fun deleteAll()
+              @Query("SELECT * FROM request_logs ORDER BY timestamp DESC") fun getAllLogs(): Flow<List<RequestLog>>
+              @Query("""SELECT * FROM request_logs WHERE (:type IS NULL OR type = :type)
+                  AND (:status IS NULL OR status = :status)
+                  AND (:q IS NULL OR url LIKE '%' || :q || '%' OR responseBody LIKE '%' || :q || '%')
+                  ORDER BY timestamp DESC""")
+              fun getFiltered(type: String? = null, status: String? = null, q: String? = null): Flow<List<RequestLog>>
+              @Query("SELECT * FROM request_logs WHERE id = :id") suspend fun getById(id: Long): RequestLog?
+              @Query("SELECT COUNT(*) FROM request_logs") fun getTotal(): Flow<Int>
+              @Query("SELECT COUNT(*) FROM request_logs WHERE status = 'SUCCESS'") fun getSuccess(): Flow<Int>
+              @Query("SELECT COUNT(*) FROM request_logs WHERE status = 'ERROR'") fun getErrors(): Flow<Int>
+              @Query("SELECT AVG(durationMs) FROM request_logs WHERE durationMs IS NOT NULL") fun getAvg(): Flow<Double?>
+              @Query("SELECT * FROM request_logs ORDER BY timestamp DESC LIMIT :n") suspend fun getRecent(n: Int = 500): List<RequestLog>
+          }
+          EOF
+          cat > $SRC/data/db/RequestTrackerDatabase.kt << 'EOF'
+          package com.requesttracker.data.db
+          import androidx.room.*
+          import com.requesttracker.data.model.RequestLog
+          @Database(entities = [RequestLog::class], version = 1, exportSchema = false)
+          @TypeConverters(Converters::class)
+          abstract class RequestTrackerDatabase : RoomDatabase() {
+              abstract fun dao(): RequestLogDao
+          }
+          EOF
+          cat > $SRC/data/repository/RequestLogRepository.kt << 'EOF'
+          package com.requesttracker.data.repository
+          import com.requesttracker.data.db.RequestLogDao
+          import com.requesttracker.data.model.*
+          import javax.inject.Inject
+          import javax.inject.Singleton
+          data class FilterParams(val type: RequestType? = null, val status: RequestStatus? = null, val query: String? = null)
+          @Singleton
+          class RequestLogRepository @Inject constructor(private val dao: RequestLogDao) {
+              val allLogs = dao.getAllLogs()
+              val total = dao.getTotal()
+              val success = dao.getSuccess()
+              val errors = dao.getErrors()
+              val avg = dao.getAvg()
+              fun filtered(p: FilterParams) = dao.getFiltered(p.type?.name, p.status?.name, p.query?.takeIf { it.isNotBlank() })
+              suspend fun insert(log: RequestLog) = dao.insert(log)
+              suspend fun delete(log: RequestLog) = dao.delete(log)
+              suspend fun deleteAll() = dao.deleteAll()
+              suspend fun getById(id: Long) = dao.getById(id)
+              suspend fun recent() = dao.getRecent()
+          }
+          EOF
+          cat > $SRC/di/AppModule.kt << 'EOF'
+          package com.requesttracker.di
+          import android.content.Context
+          import androidx.room.Room
+          import com.requesttracker.data.db.*
+          import dagger.Module
+          import dagger.Provides
+          import dagger.hilt.InstallIn
+          import dagger.hilt.android.qualifiers.ApplicationContext
+          import dagger.hilt.components.SingletonComponent
+          import javax.inject.Singleton
+          @Module @InstallIn(SingletonComponent::class)
+          object AppModule {
+              @Provides @Singleton
+              fun db(@ApplicationContext ctx: Context): RequestTrackerDatabase =
+                  Room.databaseBuilder(ctx, RequestTrackerDatabase::class.java, "rt.db").fallbackToDestructiveMigration().build()
+              @Provides fun dao(db: RequestTrackerDatabase): RequestLogDao = db.dao()
+          }
+          EOF
+          cat > $SRC/service/RequestMonitorService.kt << 'EOF'
+          package com.requesttracker.service
+          import android.app.*; import android.content.Intent; import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+          import com.requesttracker.R; import com.requesttracker.ui.MainActivity
+          class RequestMonitorService : Service() {
+              companion object { const val CH = "rt_ch"; const val NID = 1001; const val STOP = "STOP" }
+              override fun onCreate() { super.onCreate()
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CH, "Monitor", NotificationManager.IMPORTANCE_LOW))
+              }
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  if (i?.action == STOP) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return START_NOT_STICKY }
+                  val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  val stop = PendingIntent.getService(this, 1, Intent(this, RequestMonitorService::class.java).apply { action = STOP }, PendingIntent.FLAG_IMMUTABLE)
+                  startForeground(NID, NotificationCompat.Builder(this, CH).setContentTitle("Request Tracker Active")
+                      .setContentText("Monitoring requests").setSmallIcon(R.drawable.ic_monitor)
+                      .setContentIntent(open).addAction(R.drawable.ic_stop, "Stop", stop).setOngoing(true).build())
+                  return START_STICKY
+              }
+              override fun onBind(i: Intent?): IBinder? = null
+          }
+          EOF
+          cat > $SRC/ui/logs/LogsViewModel.kt << 'EOF'
+          package com.requesttracker.ui.logs
+          import androidx.lifecycle.*
+          import com.requesttracker.data.model.*
+          import com.requesttracker.data.repository.*
+          import dagger.hilt.android.lifecycle.HiltViewModel
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.flow.*
+          import javax.inject.Inject
+          data class UiState(val logs: List<RequestLog> = emptyList(), val total: Int = 0, val success: Int = 0, val errors: Int = 0, val avg: Double? = null)
+          @OptIn(ExperimentalCoroutinesApi::class)
+          @HiltViewModel
+          class LogsViewModel @Inject constructor(private val repo: RequestLogRepository) : ViewModel() {
+              private val _f = MutableStateFlow(FilterParams())
+              val state: StateFlow<UiState> = combine(_f.flatMapLatest { repo.filtered(it) }, repo.total, repo.success, repo.errors, repo.avg)
+              { logs, t, s, e, a -> UiState(logs, t, s, e, a) }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UiState())
+              fun typeFilter(t: RequestType?) = _f.update { it.copy(type = t) }
+              fun statusFilter(s: RequestStatus?) = _f.update { it.copy(status = s) }
+              fun query(q: String?) = _f.update { it.copy(query = q) }
+              fun clearFilters() { _f.value = FilterParams() }
+              fun delete(log: RequestLog) = viewModelScope.launch { repo.delete(log) }
+              fun deleteAll() = viewModelScope.launch { repo.deleteAll() }
+              suspend fun recent() = repo.recent()
+          }
+          EOF
+          cat > $SRC/ui/logs/RequestLogAdapter.kt << 'EOF'
+          package com.requesttracker.ui.logs
+          import android.graphics.Color; import android.view.*
+          import androidx.recyclerview.widget.*
+          import com.requesttracker.data.model.*
+          import com.requesttracker.databinding.ItemRequestLogBinding
+          import java.text.SimpleDateFormat; import java.util.*
+          class RequestLogAdapter(private val onClick: (RequestLog) -> Unit) : ListAdapter<RequestLog, RequestLogAdapter.VH>(object : DiffUtil.ItemCallback<RequestLog>() {
+              override fun areItemsTheSame(o: RequestLog, n: RequestLog) = o.id == n.id
+              override fun areContentsTheSame(o: RequestLog, n: RequestLog) = o == n
+          }) {
+              private val df = SimpleDateFormat("MM/dd HH:mm:ss", Locale.US)
+              inner class VH(private val b: ItemRequestLogBinding) : RecyclerView.ViewHolder(b.root) {
+                  fun bind(log: RequestLog) {
+                      b.textMethod.text = log.method; b.textUrl.text = log.url
+                      b.textTimestamp.text = df.format(Date(log.timestamp))
+                      b.textDuration.text = log.durationMs?.let { "${it}ms" } ?: "—"
+                      b.textResponseCode.text = log.responseCode?.toString() ?: "—"
+                      b.textType.text = if (log.type == RequestType.HTTP) "HTTP" else "IPC"
+                      val c = when (log.status) { RequestStatus.SUCCESS -> Color.parseColor("#4CAF50"); RequestStatus.ERROR -> Color.parseColor("#F44336"); RequestStatus.PENDING -> Color.parseColor("#FF9800") }
+                      b.statusIndicator.setBackgroundColor(c); b.textStatus.text = log.status.name; b.textStatus.setTextColor(c)
+                      b.root.setOnClickListener { onClick(log) }
+                  }
+              }
+              override fun onCreateViewHolder(p: ViewGroup, v: Int) = VH(ItemRequestLogBinding.inflate(LayoutInflater.from(p.context), p, false))
+              override fun onBindViewHolder(h: VH, pos: Int) = h.bind(getItem(pos))
+          }
+          EOF
+          cat > $SRC/ui/logs/LogsFragment.kt << 'EOF'
+          package com.requesttracker.ui.logs
+          import android.content.Intent; import android.os.Bundle; import android.view.*
+          import androidx.appcompat.widget.SearchView; import androidx.core.view.MenuProvider
+          import androidx.fragment.app.Fragment; import androidx.fragment.app.viewModels
+          import androidx.lifecycle.*; import androidx.recyclerview.widget.LinearLayoutManager
+          import com.google.android.material.dialog.MaterialAlertDialogBuilder
+          import com.requesttracker.R; import com.requesttracker.data.model.*
+          import com.requesttracker.databinding.FragmentLogsBinding
+          import com.requesttracker.ui.detail.RequestDetailActivity
+          import com.requesttracker.util.ExportUtil
+          import dagger.hilt.android.AndroidEntryPoint; import kotlinx.coroutines.launch
+          @AndroidEntryPoint
+          class LogsFragment : Fragment() {
+              private var _b: FragmentLogsBinding? = null; private val b get() = _b!!
+              private val vm: LogsViewModel by viewModels()
+              private lateinit var adapter: RequestLogAdapter
+              override fun onCreateView(i: LayoutInflater, c: ViewGroup?, s: Bundle?) = FragmentLogsBinding.inflate(i, c, false).also { _b = it }.root
+              override fun onViewCreated(v: View, s: Bundle?) {
+                  super.onViewCreated(v, s)
+                  adapter = RequestLogAdapter { log -> startActivity(Intent(requireContext(), RequestDetailActivity::class.java).putExtra(RequestDetailActivity.EXTRA_ID, log.id)) }
+                  b.recyclerView.layoutManager = LinearLayoutManager(requireContext()); b.recyclerView.adapter = adapter
+                  b.swipeRefresh.setOnRefreshListener { b.swipeRefresh.isRefreshing = false }
+                  b.chipAll.setOnClickListener { vm.typeFilter(null) }; b.chipHttp.setOnClickListener { vm.typeFilter(RequestType.HTTP) }
+                  b.chipAppToApp.setOnClickListener { vm.typeFilter(RequestType.APP_TO_APP) }
+                  b.chipSuccess.setOnClickListener { vm.statusFilter(RequestStatus.SUCCESS) }; b.chipError.setOnClickListener { vm.statusFilter(RequestStatus.ERROR) }
+                  b.chipClearStatus.setOnClickListener { vm.clearFilters() }
+                  requireActivity().addMenuProvider(object : MenuProvider {
+                      override fun onCreateMenu(menu: Menu, inf: MenuInflater) {
+                          inf.inflate(R.menu.menu_logs, menu)
+                          (menu.findItem(R.id.action_search).actionView as SearchView).setOnQueryTextListener(object : SearchView.OnQueryTextListener {
+                              override fun onQueryTextSubmit(q: String?) = true.also { vm.query(q) }
+                              override fun onQueryTextChange(q: String?) = true.also { vm.query(q) }
+                          })
+                      }
+                      override fun onMenuItemSelected(item: MenuItem) = when (item.itemId) {
+                          R.id.action_export_csv -> { doExport("csv"); true }
+                          R.id.action_export_json -> { doExport("json"); true }
+                          R.id.action_clear_all -> { MaterialAlertDialogBuilder(requireContext()).setTitle("Clear All?").setPositiveButton("Delete") { _, _ -> vm.deleteAll() }.setNegativeButton("Cancel", null).show(); true }
+                          else -> false
+                      }
+                  }, viewLifecycleOwner, Lifecycle.State.RESUMED)
+                  viewLifecycleOwner.lifecycleScope.launch { viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) { vm.state.collect { st ->
+                      adapter.submitList(st.logs)
+                      b.emptyView.visibility = if (st.logs.isEmpty()) View.VISIBLE else View.GONE
+                      b.recyclerView.visibility = if (st.logs.isEmpty()) View.GONE else View.VISIBLE
+                      b.textTotal.text = "Total: ${st.total}"; b.textSuccess.text = "✓ ${st.success}"; b.textError.text = "✗ ${st.errors}"
+                      st.avg?.let { b.textAvgDuration.text = "Avg: ${it.toLong()}ms" }
+                  }}}
+              }
+              private fun doExport(fmt: String) { viewLifecycleOwner.lifecycleScope.launch { val logs = vm.recent()
+                  val uri = if (fmt == "csv") ExportUtil.csv(requireContext(), logs) else ExportUtil.json(requireContext(), logs)
+                  ExportUtil.share(requireContext(), uri, if (fmt == "csv") "text/csv" else "application/json") } }
+              override fun onDestroyView() { super.onDestroyView(); _b = null }
+          }
+          EOF
+          cat > $SRC/ui/detail/DetailViewModel.kt << 'EOF'
+          package com.requesttracker.ui.detail
+          import androidx.lifecycle.ViewModel
+          import com.requesttracker.data.repository.RequestLogRepository
+          import dagger.hilt.android.lifecycle.HiltViewModel
+          import javax.inject.Inject
+          @HiltViewModel
+          class DetailViewModel @Inject constructor(private val repo: RequestLogRepository) : ViewModel() {
+              suspend fun get(id: Long) = repo.getById(id)
+          }
+          EOF
+          cat > $SRC/ui/detail/RequestDetailActivity.kt << 'EOF'
+          package com.requesttracker.ui.detail
+          import android.content.*; import android.os.Bundle; import android.view.MenuItem; import android.view.View
+          import androidx.activity.viewModels; import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import com.google.android.material.snackbar.Snackbar
+          import com.requesttracker.data.model.*
+          import com.requesttracker.databinding.ActivityRequestDetailBinding
+          import dagger.hilt.android.AndroidEntryPoint; import kotlinx.coroutines.launch
+          import java.text.SimpleDateFormat; import java.util.*
+          @AndroidEntryPoint
+          class RequestDetailActivity : AppCompatActivity() {
+              companion object { const val EXTRA_ID = "extra_log_id" }
+              private lateinit var b: ActivityRequestDetailBinding
+              private val vm: DetailViewModel by viewModels()
+              private val df = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s); b = ActivityRequestDetailBinding.inflate(layoutInflater); setContentView(b.root)
+                  supportActionBar?.setDisplayHomeAsUpEnabled(true)
+                  val id = intent.getLongExtra(EXTRA_ID, -1L); if (id == -1L) { finish(); return }
+                  lifecycleScope.launch {
+                      val log = vm.get(id) ?: run { finish(); return@launch }
+                      supportActionBar?.title = "${log.method} ${if (log.type == RequestType.HTTP) "HTTP" else "IPC"}"
+                      b.textTimestamp.text = "Time: ${df.format(Date(log.timestamp))}"
+                      b.textType.text = "Type: ${log.type}"; b.textMethod.text = "Method: ${log.method}"
+                      b.textUrl.text = "URL: ${log.url}"; b.textStatus.text = "Status: ${log.status}"
+                      b.textResponseCode.text = "Code: ${log.responseCode ?: "N/A"}"
+                      b.textDuration.text = "Duration: ${log.durationMs?.let { "${it}ms" } ?: "N/A"}"
+                      if (log.type == RequestType.APP_TO_APP) { b.groupApps.visibility = View.VISIBLE; b.textSourceApp.text = log.sourceApp ?: "—"; b.textTargetApp.text = log.targetApp ?: "—" }
+                      if (log.status == RequestStatus.ERROR && log.errorMessage != null) { b.groupError.visibility = View.VISIBLE; b.textError.text = log.errorMessage }
+                      b.textRequestHeaders.text = fmt(log.requestHeaders); b.textRequestBody.text = fmt(log.requestBody)
+                      b.textResponseHeaders.text = fmt(log.responseHeaders); b.textResponseBody.text = fmt(log.responseBody)
+                      b.btnCopyRequest.setOnClickListener { copy("Req", "${log.url}\n${log.requestHeaders}\n${log.requestBody}") }
+                      b.btnCopyResponse.setOnClickListener { copy("Res", "${log.responseHeaders}\n${log.responseBody}") }
+                  }
+              }
+              private fun fmt(j: String?): String { if (j.isNullOrBlank()) return "Empty"
+                  return try { val g = com.google.gson.GsonBuilder().setPrettyPrinting().create(); g.toJson(g.fromJson(j, Any::class.java)) } catch (e: Exception) { j } }
+              private fun copy(l: String, t: String) { (getSystemService(ClipboardManager::class.java)).setPrimaryClip(ClipData.newPlainText(l, t)); Snackbar.make(b.root, "Copied!", Snackbar.LENGTH_SHORT).show() }
+              override fun onOptionsItemSelected(i: MenuItem): Boolean { if (i.itemId == android.R.id.home) { onBackPressedDispatcher.onBackPressed(); return true }; return super.onOptionsItemSelected(i) }
+          }
+          EOF
+          cat > $SRC/ui/dashboard/DashboardFragment.kt << 'EOF'
+          package com.requesttracker.ui.dashboard
+          import android.os.Bundle; import android.view.*
+          import androidx.fragment.app.Fragment; import androidx.fragment.app.viewModels
+          import androidx.lifecycle.*; import androidx.recyclerview.widget.LinearLayoutManager
+          import com.requesttracker.databinding.FragmentDashboardBinding
+          import com.requesttracker.ui.logs.*
+          import dagger.hilt.android.AndroidEntryPoint; import kotlinx.coroutines.launch
+          @AndroidEntryPoint
+          class DashboardFragment : Fragment() {
+              private var _b: FragmentDashboardBinding? = null; private val b get() = _b!!
+              private val vm: LogsViewModel by viewModels()
+              override fun onCreateView(i: LayoutInflater, c: ViewGroup?, s: Bundle?) = FragmentDashboardBinding.inflate(i, c, false).also { _b = it }.root
+              override fun onViewCreated(v: View, s: Bundle?) {
+                  super.onViewCreated(v, s)
+                  val adapter = RequestLogAdapter {}
+                  b.recyclerRecent.layoutManager = LinearLayoutManager(requireContext()); b.recyclerRecent.adapter = adapter; b.recyclerRecent.isNestedScrollingEnabled = false
+                  viewLifecycleOwner.lifecycleScope.launch { viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) { vm.state.collect { st ->
+                      b.textTotalValue.text = st.total.toString(); b.textSuccessValue.text = st.success.toString()
+                      b.textErrorValue.text = st.errors.toString(); b.textAvgValue.text = st.avg?.let { "${it.toLong()}ms" } ?: "—"
+                      val r = if (st.total > 0) (st.errors * 100 / st.total) else 0
+                      b.progressErrorRate.progress = r; b.textErrorRate.text = "Error Rate: $r%"
+                      adapter.submitList(st.logs.take(5))
+                  }}}
+              }
+              override fun onDestroyView() { super.onDestroyView(); _b = null }
+          }
+          EOF
+          cat > $SRC/ui/MainActivity.kt << 'EOF'
+          package com.requesttracker.ui
+          import android.content.Intent; import android.os.Bundle
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.navigation.findNavController; import androidx.navigation.ui.*
+          import com.requesttracker.R; import com.requesttracker.databinding.ActivityMainBinding
+          import com.requesttracker.service.RequestMonitorService
+          import dagger.hilt.android.AndroidEntryPoint
+          @AndroidEntryPoint
+          class MainActivity : AppCompatActivity() {
+              private lateinit var b: ActivityMainBinding
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s); b = ActivityMainBinding.inflate(layoutInflater); setContentView(b.root)
+                  val nav = findNavController(R.id.nav_host_fragment)
+                  setupActionBarWithNavController(nav, AppBarConfiguration(setOf(R.id.nav_dashboard, R.id.nav_logs)))
+                  b.bottomNav.setupWithNavController(nav)
+                  startForegroundService(Intent(this, RequestMonitorService::class.java))
+              }
+              override fun onSupportNavigateUp() = findNavController(R.id.nav_host_fragment).navigateUp() || super.onSupportNavigateUp()
+          }
+          EOF
+          cat > $SRC/util/ExportUtil.kt << 'EOF'
+          package com.requesttracker.util
+          import android.content.Context; import android.content.Intent; import android.net.Uri
+          import androidx.core.content.FileProvider; import com.google.gson.GsonBuilder
+          import com.requesttracker.data.model.RequestLog
+          import java.io.File; import java.io.FileWriter; import java.text.SimpleDateFormat; import java.util.*
+          object ExportUtil {
+              private val df = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
+              private val gson = GsonBuilder().setPrettyPrinting().create()
+              fun json(ctx: Context, logs: List<RequestLog>): Uri {
+                  val f = File(ctx.cacheDir, "logs_${System.currentTimeMillis()}.json").apply { writeText(gson.toJson(logs)) }
+                  return FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", f)
+              }
+              fun csv(ctx: Context, logs: List<RequestLog>): Uri {
+                  val f = File(ctx.cacheDir, "logs_${System.currentTimeMillis()}.csv")
+                  FileWriter(f).use { w -> w.appendLine("ID,Time,Type,Method,URL,Status,Code,DurationMs,Error")
+                      logs.forEach { w.appendLine("${it.id},${df.format(Date(it.timestamp))},${it.type},${it.method},\"${it.url}\",${it.status},${it.responseCode?:""},${it.durationMs?:""},\"${it.errorMessage?:""}\"") }
+                  }
+                  return FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", f)
+              }
+              fun share(ctx: Context, uri: Uri, mime: String) = ctx.startActivity(Intent.createChooser(
+                  Intent(Intent.ACTION_SEND).apply { type = mime; putExtra(Intent.EXTRA_STREAM, uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }, "Export"))
+          }
+          EOF
+          cat > $RES/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources><string name="app_name">Request Tracker</string></resources>
+          EOF
+          cat > $RES/values/colors.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="purple_500">#FF6200EE</color><color name="purple_700">#FF3700B3</color>
+              <color name="teal_200">#FF03DAC5</color><color name="white">#FFFFFFFF</color>
+              <color name="black">#FF000000</color><color name="stats_bg">#FF1E1E2E</color>
+          </resources>
+          EOF
+          cat > $RES/values/themes.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources xmlns:tools="http://schemas.android.com/tools">
+              <style name="Theme.RequestTracker" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+                  <item name="colorPrimary">@color/purple_500</item>
+                  <item name="colorPrimaryVariant">@color/purple_700</item>
+                  <item name="colorOnPrimary">@color/white</item>
+                  <item name="colorSecondary">@color/teal_200</item>
+                  <item name="android:statusBarColor" tools:targetApi="l">?attr/colorPrimaryVariant</item>
+              </style>
+          </resources>
+          EOF
+          cat > $RES/xml/file_paths.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths><cache-path name="shared_files" path="."/></paths>
+          EOF
+          cat > $RES/drawable/ic_monitor.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+          <path android:fillColor="@android:color/white" android:pathData="M20,3H4v10c0,2.21 1.79,4 4,4h6c2.21,0 4-1.79 4-4v-3h2c1.11,0 2-0.89 2-2V5c0-1.11-0.89-2-2-2zM20,8h-2V5h2v3zM4,19h16v2H4z"/></vector>
+          EOF
+          cat > $RES/drawable/ic_stop.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+          <path android:fillColor="@android:color/white" android:pathData="M6,6h12v12H6z"/></vector>
+          EOF
+          cat > $RES/drawable/ic_dashboard.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+          <path android:fillColor="@android:color/white" android:pathData="M3,13h8V3H3v10zm0,8h8v-6H3v6zm10,0h8V11h-8v10zm0-18v6h8V3h-8z"/></vector>
+          EOF
+          cat > $RES/drawable/ic_list.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+          <path android:fillColor="@android:color/white" android:pathData="M3,18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></vector>
+          EOF
+          cat > $RES/drawable/ic_search.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
+          <path android:fillColor="@android:color/white" android:pathData="M15.5,14h-0.79l-0.28-0.27C15.41,12.59 16,11.11 16,9.5 16,5.91 13.09,3 9.5,3S3,5.91 3,9.5 5.91,16 9.5,16c1.61,0 3.09-0.59 4.23-1.57l0.27,0.28v0.79l5,4.99L20.49,19l-4.99-5zM9.5,14C7.01,14 5,11.99 5,9.5S7.01,5 9.5,5 14,7.01 14,9.5 11.99,14 9.5,14z"/></vector>
+          EOF
+          cat > $RES/drawable/bg_badge.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+          <solid android:color="#FF6200EE"/><corners android:radius="4dp"/></shape>
+          EOF
+          cat > $RES/menu/menu_bottom_nav.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <menu xmlns:android="http://schemas.android.com/apk/res/android">
+              <item android:id="@+id/nav_dashboard" android:icon="@drawable/ic_dashboard" android:title="Dashboard"/>
+              <item android:id="@+id/nav_logs" android:icon="@drawable/ic_list" android:title="Logs"/>
+          </menu>
+          EOF
+          cat > $RES/menu/menu_logs.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <menu xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto">
+              <item android:id="@+id/action_search" android:title="Search" android:icon="@drawable/ic_search" app:showAsAction="ifRoom|collapseActionView" app:actionViewClass="androidx.appcompat.widget.SearchView"/>
+              <item android:id="@+id/action_export_csv" android:title="Export CSV" app:showAsAction="never"/>
+              <item android:id="@+id/action_export_json" android:title="Export JSON" app:showAsAction="never"/>
+              <item android:id="@+id/action_clear_all" android:title="Clear All" app:showAsAction="never"/>
+          </menu>
+          EOF
+          cat > $RES/navigation/nav_graph.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <navigation xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              android:id="@+id/nav_graph" app:startDestination="@id/nav_dashboard">
+              <fragment android:id="@+id/nav_dashboard" android:name="com.requesttracker.ui.dashboard.DashboardFragment" android:label="Dashboard"/>
+              <fragment android:id="@+id/nav_logs" android:name="com.requesttracker.ui.logs.LogsFragment" android:label="Logs"/>
+          </navigation>
+          EOF
+          cat > $RES/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent">
+              <fragment android:id="@+id/nav_host_fragment" android:name="androidx.navigation.fragment.NavHostFragment"
+                  android:layout_width="match_parent" android:layout_height="0dp"
+                  app:defaultNavHost="true" app:navGraph="@navigation/nav_graph"
+                  app:layout_constraintTop_toTopOf="parent" app:layout_constraintBottom_toTopOf="@id/bottom_nav"/>
+              <com.google.android.material.bottomnavigation.BottomNavigationView android:id="@+id/bottom_nav"
+                  android:layout_width="match_parent" android:layout_height="wrap_content"
+                  app:menu="@menu/menu_bottom_nav"
+                  app:layout_constraintBottom_toBottomOf="parent" app:layout_constraintStart_toStartOf="parent" app:layout_constraintEnd_toEndOf="parent"/>
+          </androidx.constraintlayout.widget.ConstraintLayout>
+          EOF
+          cat > $RES/layout/fragment_logs.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <androidx.coordinatorlayout.widget.CoordinatorLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent">
+              <com.google.android.material.appbar.AppBarLayout android:layout_width="match_parent" android:layout_height="wrap_content">
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="48dp" android:orientation="horizontal" android:background="@color/stats_bg" android:padding="8dp" android:gravity="center_vertical">
+                      <TextView android:id="@+id/text_total" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:textSize="12sp" android:textColor="@color/white" android:text="Total: 0"/>
+                      <TextView android:id="@+id/text_success" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:textSize="12sp" android:textColor="#4CAF50" android:text="✓ 0"/>
+                      <TextView android:id="@+id/text_error" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:textSize="12sp" android:textColor="#F44336" android:text="✗ 0"/>
+                      <TextView android:id="@+id/text_avg_duration" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:textSize="12sp" android:textColor="@color/white" android:text="Avg: —"/>
+                  </LinearLayout>
+                  <HorizontalScrollView android:layout_width="match_parent" android:layout_height="wrap_content" android:scrollbars="none">
+                      <com.google.android.material.chip.ChipGroup android:layout_width="wrap_content" android:layout_height="wrap_content" android:padding="8dp">
+                          <com.google.android.material.chip.Chip android:id="@+id/chip_all" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="All" style="@style/Widget.MaterialComponents.Chip.Filter"/>
+                          <com.google.android.material.chip.Chip android:id="@+id/chip_http" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="HTTP" style="@style/Widget.MaterialComponents.Chip.Filter"/>
+                          <com.google.android.material.chip.Chip android:id="@+id/chip_app_to_app" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="App-to-App" style="@style/Widget.MaterialComponents.Chip.Filter"/>
+                          <com.google.android.material.chip.Chip android:id="@+id/chip_success" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Success" style="@style/Widget.MaterialComponents.Chip.Filter"/>
+                          <com.google.android.material.chip.Chip android:id="@+id/chip_error" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Error" style="@style/Widget.MaterialComponents.Chip.Filter"/>
+                          <com.google.android.material.chip.Chip android:id="@+id/chip_clear_status" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="Clear" style="@style/Widget.MaterialComponents.Chip.Filter"/>
+                      </com.google.android.material.chip.ChipGroup>
+                  </HorizontalScrollView>
+              </com.google.android.material.appbar.AppBarLayout>
+              <androidx.swiperefreshlayout.widget.SwipeRefreshLayout android:id="@+id/swipe_refresh"
+                  android:layout_width="match_parent" android:layout_height="match_parent" app:layout_behavior="@string/appbar_scrolling_view_behavior">
+                  <FrameLayout android:layout_width="match_parent" android:layout_height="match_parent">
+                      <androidx.recyclerview.widget.RecyclerView android:id="@+id/recycler_view" android:layout_width="match_parent" android:layout_height="match_parent" android:paddingBottom="8dp" android:clipToPadding="false"/>
+                      <LinearLayout android:id="@+id/empty_view" android:layout_width="match_parent" android:layout_height="match_parent" android:gravity="center" android:orientation="vertical" android:visibility="gone">
+                          <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="📭" android:textSize="64sp"/>
+                          <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="No requests yet" android:textSize="18sp" android:layout_marginTop="16dp"/>
+                      </LinearLayout>
+                  </FrameLayout>
+              </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+          </androidx.coordinatorlayout.widget.CoordinatorLayout>
+          EOF
+          cat > $RES/layout/item_request_log.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <com.google.android.material.card.MaterialCardView xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="wrap_content"
+              android:layout_marginHorizontal="8dp" android:layout_marginVertical="4dp" app:cardElevation="2dp" app:cardCornerRadius="8dp">
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="12dp">
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:gravity="center_vertical">
+                      <View android:id="@+id/status_indicator" android:layout_width="4dp" android:layout_height="40dp" android:layout_marginEnd="8dp" android:background="#4CAF50"/>
+                      <TextView android:id="@+id/text_type" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="HTTP" android:textSize="10sp" android:textColor="@color/white" android:background="@drawable/bg_badge" android:paddingHorizontal="6dp" android:paddingVertical="2dp" android:layout_marginEnd="6dp"/>
+                      <TextView android:id="@+id/text_method" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textStyle="bold" android:textSize="13sp" android:layout_marginEnd="6dp"/>
+                      <TextView android:id="@+id/text_url" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:textSize="13sp" android:singleLine="true" android:ellipsize="end"/>
+                  </LinearLayout>
+                  <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:gravity="center_vertical" android:layout_marginTop="6dp">
+                      <TextView android:id="@+id/text_status" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="11sp" android:textStyle="bold"/>
+                      <TextView android:id="@+id/text_response_code" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="11sp" android:layout_marginStart="8dp"/>
+                      <View android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
+                      <TextView android:id="@+id/text_duration" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="11sp" android:layout_marginEnd="8dp"/>
+                      <TextView android:id="@+id/text_timestamp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="11sp"/>
+                  </LinearLayout>
+              </LinearLayout>
+          </com.google.android.material.card.MaterialCardView>
+          EOF
+          cat > $RES/layout/activity_request_detail.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent">
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp">
+                  <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" app:cardCornerRadius="8dp" android:layout_marginBottom="12dp">
+                      <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp">
+                          <TextView android:text="OVERVIEW" android:textStyle="bold" android:textSize="12sp" android:textColor="?colorPrimary" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginBottom="8dp"/>
+                          <TextView android:id="@+id/text_timestamp" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="13sp"/>
+                          <TextView android:id="@+id/text_type" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="13sp"/>
+                          <TextView android:id="@+id/text_method" android:layout_width="match_parent" android:layout_height="wrap_content" android:textStyle="bold" android:textSize="14sp"/>
+                          <TextView android:id="@+id/text_url" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="13sp"/>
+                          <TextView android:id="@+id/text_status" android:layout_width="match_parent" android:layout_height="wrap_content" android:textStyle="bold" android:textSize="13sp"/>
+                          <TextView android:id="@+id/text_response_code" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="13sp"/>
+                          <TextView android:id="@+id/text_duration" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="13sp"/>
+                      </LinearLayout>
+                  </com.google.android.material.card.MaterialCardView>
+                  <LinearLayout android:id="@+id/group_apps" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:visibility="gone">
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" app:cardCornerRadius="8dp" android:layout_marginBottom="12dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp">
+                              <TextView android:text="APP-TO-APP" android:textStyle="bold" android:textSize="12sp" android:textColor="?colorPrimary" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                              <TextView android:id="@+id/text_source_app" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="13sp" android:layout_marginTop="4dp"/>
+                              <TextView android:id="@+id/text_target_app" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="13sp" android:layout_marginTop="4dp"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                  </LinearLayout>
+                  <LinearLayout android:id="@+id/group_error" android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:visibility="gone">
+                      <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" app:cardCornerRadius="8dp" android:layout_marginBottom="12dp" app:cardBackgroundColor="#FFEBEE">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp">
+                              <TextView android:text="ERROR" android:textStyle="bold" android:textSize="12sp" android:textColor="#F44336" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                              <TextView android:id="@+id/text_error" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="13sp" android:fontFamily="monospace" android:layout_marginTop="4dp"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                  </LinearLayout>
+                  <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" app:cardCornerRadius="8dp" android:layout_marginBottom="12dp">
+                      <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:text="REQUEST" android:textStyle="bold" android:textSize="12sp" android:textColor="?colorPrimary" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"/>
+                              <Button android:id="@+id/btn_copy_request" android:text="Copy" style="@style/Widget.MaterialComponents.Button.OutlinedButton" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="11sp"/>
+                          </LinearLayout>
+                          <TextView android:text="Headers:" android:textStyle="bold" android:textSize="12sp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
+                          <TextView android:id="@+id/text_request_headers" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="12sp" android:fontFamily="monospace" android:background="#F5F5F5" android:padding="8dp" android:layout_marginTop="4dp"/>
+                          <TextView android:text="Body:" android:textStyle="bold" android:textSize="12sp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
+                          <TextView android:id="@+id/text_request_body" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="12sp" android:fontFamily="monospace" android:background="#F5F5F5" android:padding="8dp" android:layout_marginTop="4dp"/>
+                      </LinearLayout>
+                  </com.google.android.material.card.MaterialCardView>
+                  <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" app:cardCornerRadius="8dp" android:layout_marginBottom="12dp">
+                      <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="horizontal" android:gravity="center_vertical">
+                              <TextView android:text="RESPONSE" android:textStyle="bold" android:textSize="12sp" android:textColor="?colorPrimary" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1"/>
+                              <Button android:id="@+id/btn_copy_response" android:text="Copy" style="@style/Widget.MaterialComponents.Button.OutlinedButton" android:layout_width="wrap_content" android:layout_height="wrap_content" android:textSize="11sp"/>
+                          </LinearLayout>
+                          <TextView android:text="Headers:" android:textStyle="bold" android:textSize="12sp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
+                          <TextView android:id="@+id/text_response_headers" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="12sp" android:fontFamily="monospace" android:background="#F5F5F5" android:padding="8dp" android:layout_marginTop="4dp"/>
+                          <TextView android:text="Body:" android:textStyle="bold" android:textSize="12sp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="8dp"/>
+                          <TextView android:id="@+id/text_response_body" android:layout_width="match_parent" android:layout_height="wrap_content" android:textSize="12sp" android:fontFamily="monospace" android:background="#F5F5F5" android:padding="8dp" android:layout_marginTop="4dp"/>
+                      </LinearLayout>
+                  </com.google.android.material.card.MaterialCardView>
+              </LinearLayout>
+          </androidx.core.widget.NestedScrollView>
+          EOF
+          cat > $RES/layout/fragment_dashboard.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <androidx.core.widget.NestedScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto" android:layout_width="match_parent" android:layout_height="match_parent">
+              <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp">
+                  <TextView android:text="Overview" android:textSize="22sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginBottom="16dp"/>
+                  <GridLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:columnCount="2" android:layout_marginBottom="16dp">
+                      <com.google.android.material.card.MaterialCardView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_columnWeight="1" android:layout_margin="4dp" app:cardCornerRadius="8dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp" android:gravity="center">
+                              <TextView android:id="@+id/text_total_value" android:text="0" android:textSize="32sp" android:textStyle="bold" android:textColor="?colorPrimary" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                              <TextView android:text="Total" android:textSize="12sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_columnWeight="1" android:layout_margin="4dp" app:cardCornerRadius="8dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp" android:gravity="center">
+                              <TextView android:id="@+id/text_success_value" android:text="0" android:textSize="32sp" android:textStyle="bold" android:textColor="#4CAF50" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                              <TextView android:text="Success" android:textSize="12sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_columnWeight="1" android:layout_margin="4dp" app:cardCornerRadius="8dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp" android:gravity="center">
+                              <TextView android:id="@+id/text_error_value" android:text="0" android:textSize="32sp" android:textStyle="bold" android:textColor="#F44336" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                              <TextView android:text="Errors" android:textSize="12sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                      <com.google.android.material.card.MaterialCardView android:layout_width="0dp" android:layout_height="wrap_content" android:layout_columnWeight="1" android:layout_margin="4dp" app:cardCornerRadius="8dp">
+                          <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp" android:gravity="center">
+                              <TextView android:id="@+id/text_avg_value" android:text="—" android:textSize="28sp" android:textStyle="bold" android:textColor="?colorSecondary" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                              <TextView android:text="Avg Duration" android:textSize="12sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                          </LinearLayout>
+                      </com.google.android.material.card.MaterialCardView>
+                  </GridLayout>
+                  <com.google.android.material.card.MaterialCardView android:layout_width="match_parent" android:layout_height="wrap_content" app:cardCornerRadius="8dp" android:layout_marginBottom="16dp">
+                      <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:padding="16dp">
+                          <TextView android:id="@+id/text_error_rate" android:text="Error Rate: 0%" android:textStyle="bold" android:textSize="14sp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginBottom="8dp"/>
+                          <ProgressBar android:id="@+id/progress_error_rate" style="@style/Widget.AppCompat.ProgressBar.Horizontal" android:layout_width="match_parent" android:layout_height="8dp" android:progress="0" android:max="100"/>
+                      </LinearLayout>
+                  </com.google.android.material.card.MaterialCardView>
+                  <TextView android:text="Recent Requests" android:textSize="16sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginBottom="8dp"/>
+                  <androidx.recyclerview.widget.RecyclerView android:id="@+id/recycler_recent" android:layout_width="match_parent" android:layout_height="wrap_content" android:nestedScrollingEnabled="false"/>
+              </LinearLayout>
+          </androidx.core.widget.NestedScrollView>
+          EOF
+          for dpi in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            cat > app/src/main/res/mipmap-$dpi/ic_launcher.xml << 'ICON'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/purple_500"/>
+              <foreground android:drawable="@drawable/ic_monitor"/>
+          </adaptive-icon>
+          ICON
+            cp app/src/main/res/mipmap-$dpi/ic_launcher.xml app/src/main/res/mipmap-$dpi/ic_launcher_round.xml
+          done
+          echo "All files generated!"
+      - name: Setup Gradle Wrapper
+        run: gradle wrapper --gradle-version 8.2
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*') }}
+      - name: Build Debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RequestTracker-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+      - name: Get Date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d-%H%M')" >> $GITHUB_OUTPUT
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ steps.date.outputs.date }}
+          name: "RequestTracker APK — ${{ steps.date.outputs.date }}"
+          body: |
+            ## 📱 RequestTracker APK - Ready to Install!
+            1. Tap app-debug.apk below to download
+            2. Open from your Files app
+            3. Tap Install ✅
+          files: app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
